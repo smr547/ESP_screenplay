@@ -60,8 +60,8 @@ class Tile {
 
 // array of tiles represents the screen
 
-#define TILES_X 16
-#define TILES_Y 12
+//#define TILES_X 16
+//#define TILES_Y 12
 
 constexpr int16_t tilesX = TILES_X;
 constexpr int16_t tilesY = TILES_Y;
