@@ -3,10 +3,40 @@
 #include <TFT_eSPI.h>
 #include <stdio.h>
 
-TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h
+uint32_t screenWidth, screenHeight;
+volatile bool penDownFlag = false;
+
+void IRAM_ATTR penIRQ_ISR() {
+    penDownFlag = true;
+    detachInterrupt(digitalPinToInterrupt(TOUCH_IRQ));
+}
+
+TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h;
 
 #define TFT_GREY 0xBDF7
 #define VERY_LIGHT_GREY 0xF7BE
+
+// TFT and XPT2046 share the same bus but operate at different rates
+
+SPISettings tftSPI(40000000, MSBFIRST, SPI_MODE0);  // example
+SPISettings touchSPI(500000, MSBFIRST, SPI_MODE0);  // conservative & clean
+
+uint16_t xpt2046_read(uint8_t cmd) {
+    uint16_t result = 0;
+
+    SPI.beginTransaction(touchSPI);
+    digitalWrite(TOUCH_CS, LOW);
+
+    SPI.transfer(cmd);
+    uint8_t hi = SPI.transfer(0x00);
+    uint8_t lo = SPI.transfer(0x00);
+
+    digitalWrite(TOUCH_CS, HIGH);
+    SPI.endTransaction();
+
+    result = ((hi << 8) | lo) >> 3;  // 12-bit value
+    return result & 0x0FFF;
+}
 
 // Assume global TFT object, e.g. TFT_eSPI tft;
 
@@ -77,15 +107,78 @@ constexpr int16_t tilesY = TILES_Y;
 
 Tile tiles[tilesY][tilesX];
 
+// ---- Simple touch gating: one toggle per pen-down ----
+void handleTouch(uint16_t rawX, uint16_t rawY) {
+    // Gate repeated toggles while the pen is held down
+    // (release is detected when PENIRQ goes HIGH again)
+    static bool touchArmed = true;  // re-armed when pen lifted
+    static uint32_t lastTouchMs = 0;
+
+    Serial.print("handleTouch at x=");
+    Serial.print(rawX);
+    Serial.print(", y=");
+    Serial.print(rawY);
+    Serial.println("");
+
+    // If pen lifted, re-arm and exit (nothing to do)
+    if (digitalRead(TOUCH_IRQ) == HIGH) {
+        touchArmed = true;
+        return;
+    }
+
+    // Optional: debounce the IRQ / panel contact a bit
+    uint32_t now = millis();
+    if (!touchArmed) return;             // already handled this press
+    if (now - lastTouchMs < 60) return;  // simple debounce window (tune)
+
+    // Sanity check raw range (reject obvious noise / misreads)
+    // if (rawX < 50 || rawX > 4095 || rawY < 50 || rawY > 4095) {
+    //  return;
+    //}
+
+    // Map raw ADC -> screen coordinates
+    // Note: Depending on your wiring/orientation, X/Y may be swapped or
+    // inverted. Start with this and adjust later.
+    int sx = (int)(((int32_t)(rawX - X_MIN) * screenWidth) / (X_MAX - X_MIN));
+    int sy = (int)(((int32_t)(rawY - Y_MIN) * screenHeight) / (Y_MAX - Y_MIN));
+
+    // Clamp
+    if (sx < 0) sx = 0;
+    if (sx >= screenWidth) sx = screenWidth - 1;
+    if (sy < 0) sy = 0;
+    if (sy >= screenHeight) sy = screenHeight - 1;
+
+    // Convert to tile coordinates
+    int tx = sx / TILE_SIZE;
+    int ty = sy / TILE_SIZE;
+
+    // Clamp tile indices (in case of rounding edge cases)
+    if (tx < 0) tx = 0;
+    if (tx >= TILES_X) tx = TILES_X - 1;
+    if (ty < 0) ty = 0;
+    if (ty >= TILES_Y) ty = TILES_Y - 1;
+
+    // Toggle + redraw exactly one tile
+    tiles[ty][tx].toggle();
+
+    // Disarm until pen-up
+    touchArmed = false;
+    lastTouchMs = now;
+}
+
 void setup() {
     Serial.begin(115200);
+    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
 
     tft.init();
     uint8_t rotation = TFT_ROTATION;
     tft.setRotation(rotation);
 
-    int maxRow = int(tft.height() / TILE_SIZE);
-    int maxCol = int(tft.width() / TILE_SIZE);
+    screenWidth = tft.width();
+    screenHeight = tft.height();
+
+    int maxRow = int(screenHeight / TILE_SIZE);
+    int maxCol = int(screenWidth / TILE_SIZE);
 
     for (int row = 0; row < maxRow; row++) {
         for (int col = 0; col < maxCol; col++) {
@@ -95,18 +188,24 @@ void setup() {
         }
     }
 
-    randomSeed(analogRead(A0));
+    // add the pen interrupt handler
+    pinMode(TOUCH_IRQ, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(TOUCH_IRQ), penIRQ_ISR, FALLING);
 }
 
 void loop() {
-    // put your main code here, to run repeatedly:
-    int maxRow = int(tft.height() / TILE_SIZE);
-    int maxCol = int(tft.width() / TILE_SIZE);
+    // 1. Touch event?
+    if (penDownFlag) {
+        Serial.println("pen down event");
+        penDownFlag = false;
 
-    int row = random(maxRow);
-    int col = random(maxCol);
+        if (digitalRead(TOUCH_IRQ) == LOW) {  // still touching
+            uint16_t rawX = xpt2046_read(0x90);
+            uint16_t rawY = xpt2046_read(0xD0);
 
-    tiles[row][col].toggle();
-
-    delay(200);
+            // Map raw -> screen -> tile
+            handleTouch(rawX, rawY);
+        }
+        attachInterrupt(digitalPinToInterrupt(TOUCH_IRQ), penIRQ_ISR, FALLING);
+    }
 }
