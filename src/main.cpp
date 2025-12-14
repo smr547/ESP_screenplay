@@ -3,12 +3,32 @@
 #include <TFT_eSPI.h>
 #include <stdio.h>
 
+#define CMD_X 0b10010000   // X position
+#define CMD_Y 0b11010000   // Y position
+#define CMD_Z1 0b10110000  // Z1 (pressure-related)
+#define CMD_Z2 0b11000000  // Z2 (optional if you want fancier pressure)
+
+#define PENIRQ_EN 26
+
 uint32_t screenWidth, screenHeight;
+volatile bool touchArmed = true;  // re-armed when pen lifted
 volatile bool penDownFlag = false;
 
-void IRAM_ATTR penIRQ_ISR() {
-    penDownFlag = true;
+void disablePen_IRQ() {
+    digitalWrite(PENIRQ_EN, LOW);
     detachInterrupt(digitalPinToInterrupt(TOUCH_IRQ));
+    touchArmed = false;
+}
+
+void IRAM_ATTR penIRQ_ISR() {
+    disablePen_IRQ();
+    penDownFlag = true;
+}
+
+void enablePen_IRQ() {
+    digitalWrite(PENIRQ_EN, HIGH);
+    touchArmed = true;
+    attachInterrupt(digitalPinToInterrupt(TOUCH_IRQ), penIRQ_ISR, FALLING);
 }
 
 TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h;
@@ -19,22 +39,28 @@ TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h;
 // TFT and XPT2046 share the same bus but operate at different rates
 
 SPISettings tftSPI(40000000, MSBFIRST, SPI_MODE0);  // example
-SPISettings touchSPI(500000, MSBFIRST, SPI_MODE0);  // conservative & clean
+SPISettings touchSPI(100000, MSBFIRST, SPI_MODE0);  // conservative & clean
 
 uint16_t xpt2046_read(uint8_t cmd) {
     uint16_t result = 0;
 
-    SPI.beginTransaction(touchSPI);
+    tft.getSPIinstance().beginTransaction(touchSPI);
     digitalWrite(TOUCH_CS, LOW);
 
-    SPI.transfer(cmd);
-    uint8_t hi = SPI.transfer(0x00);
-    uint8_t lo = SPI.transfer(0x00);
+    tft.getSPIinstance().transfer(cmd);
+    uint8_t hi = tft.getSPIinstance().transfer(0x00);
+    uint8_t lo = tft.getSPIinstance().transfer(0x00);
 
     digitalWrite(TOUCH_CS, HIGH);
-    SPI.endTransaction();
+    tft.getSPIinstance().endTransaction();
 
-    result = ((hi << 8) | lo) >> 3;  // 12-bit value
+    Serial.println(cmd, HEX);
+    Serial.println(hi, BIN);
+    Serial.println(lo, BIN);
+
+    result = ((hi << 8) | lo) >> 4;  // 12-bit value
+
+    Serial.println(result, HEX);
     return result & 0x0FFF;
 }
 
@@ -111,8 +137,8 @@ Tile tiles[tilesY][tilesX];
 void handleTouch(uint16_t rawX, uint16_t rawY) {
     // Gate repeated toggles while the pen is held down
     // (release is detected when PENIRQ goes HIGH again)
-    static bool touchArmed = true;  // re-armed when pen lifted
-    static uint32_t lastTouchMs = 0;
+
+    // static uint32_t lastTouchMs = 0;
 
     Serial.print("handleTouch at x=");
     Serial.print(rawX);
@@ -122,14 +148,25 @@ void handleTouch(uint16_t rawX, uint16_t rawY) {
 
     // If pen lifted, re-arm and exit (nothing to do)
     if (digitalRead(TOUCH_IRQ) == HIGH) {
-        touchArmed = true;
+        Serial.println(
+            "Pen lifted while in handleTouch() -- ignoring interrupt");
+        enablePen_IRQ();
         return;
     }
 
     // Optional: debounce the IRQ / panel contact a bit
-    uint32_t now = millis();
-    if (!touchArmed) return;             // already handled this press
-    if (now - lastTouchMs < 60) return;  // simple debounce window (tune)
+    // uint32_t now = millis();
+    /*
+    if (!touchArmed) {
+        Serial.println("pen down already handled, ignoring");
+        return;  // already handled this press
+    }
+
+    if (now - lastTouchMs < 60) {
+        Serial.println("bounce of pen down ignored");
+        return;  // simple debounce window (tune)
+    }
+    */
 
     // Sanity check raw range (reject obvious noise / misreads)
     // if (rawX < 50 || rawX > 4095 || rawY < 50 || rawY > 4095) {
@@ -162,8 +199,8 @@ void handleTouch(uint16_t rawX, uint16_t rawY) {
     tiles[ty][tx].toggle();
 
     // Disarm until pen-up
-    touchArmed = false;
-    lastTouchMs = now;
+    // lastTouchMs = now;
+    enablePen_IRQ();
 }
 
 void setup() {
@@ -190,7 +227,8 @@ void setup() {
 
     // add the pen interrupt handler
     pinMode(TOUCH_IRQ, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(TOUCH_IRQ), penIRQ_ISR, FALLING);
+    pinMode(PENIRQ_EN, OUTPUT);
+    enablePen_IRQ();
 }
 
 void loop() {
@@ -199,13 +237,21 @@ void loop() {
         Serial.println("pen down event");
         penDownFlag = false;
 
-        if (digitalRead(TOUCH_IRQ) == LOW) {  // still touching
-            uint16_t rawX = xpt2046_read(0x90);
-            uint16_t rawY = xpt2046_read(0xD0);
+        if (digitalRead(TOUCH_IRQ) == LOW) {      // still touching
+            uint16_t rawX = xpt2046_read(CMD_X);  // 0x90
+            uint16_t rawY = xpt2046_read(CMD_Y);  // 0xD0
 
             // Map raw -> screen -> tile
             handleTouch(rawX, rawY);
+        } else {
+            Serial.println("pen down no longer present -- ignore interrupt");
+            enablePen_IRQ();
         }
-        attachInterrupt(digitalPinToInterrupt(TOUCH_IRQ), penIRQ_ISR, FALLING);
+        /*
+            } else {
+                if (digitalRead(TOUCH_IRQ) == HIGH) {
+                    enablePen_IRQ();
+                }
+                */
     }
 }
